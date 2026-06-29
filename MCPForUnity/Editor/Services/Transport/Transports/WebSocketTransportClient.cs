@@ -150,7 +150,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 {
                     if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
                     {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", CancellationToken.None).ConfigureAwait(false);
+                        // Bound the graceful close handshake. With CancellationToken.None a wedged /
+                        // half-open socket (e.g. after the server drops on a domain reload) waits
+                        // forever for a close reply that never arrives, hanging any synchronous caller.
+                        using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", closeCts.Token).ConfigureAwait(false);
                     }
                 }
                 catch { }
@@ -230,19 +234,13 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 return;
             }
 
-            try
-            {
-                // Ensure background loops are stopped before disposing shared resources
-                StopAsync().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                McpLog.Warn($"[WebSocket] Dispose failed to stop cleanly: {ex.Message}");
-            }
+            // Synchronous, non-blocking teardown. Do NOT call the awaitable StopAsync() here: its
+            // graceful CloseAsync can block the calling (often main) thread on a wedged socket, which
+            // froze the editor on domain reloads. ForceStop aborts the socket and disposes the
+            // connection resources without awaiting a close handshake.
+            ForceStop();
 
             _sendLock?.Dispose();
-            _socket?.Dispose();
-            _lifecycleCts?.Dispose();
             _disposed = true;
         }
 
