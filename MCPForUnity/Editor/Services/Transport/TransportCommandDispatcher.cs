@@ -24,6 +24,20 @@ namespace MCPForUnity.Editor.Services.Transport
         private static int _mainThreadId;
         private static int _processingFlag;
 
+        // ---- Main-thread watchdog -------------------------------------------------------------
+        // ProcessCommand runs each tool/resource handler synchronously on the Unity main thread, so a
+        // handler that blocks or loops freezes the whole editor with nothing in the log to name it
+        // (the user's only recourse is force-quit). This watchdog runs on a background timer thread and,
+        // if the handler currently executing on the main thread overruns, logs which command it is.
+        // Debug.LogWarning writes to Editor.log from the background thread even while the main thread is
+        // wedged, so the next freeze names its culprit instead of being a silent mystery.
+        private static volatile string _executingCommandType;
+        private static long _executingStartedAtTicks; // UtcNow ticks when the current main-thread handler began; 0 when idle
+        private static volatile bool _watchdogWarned;
+        private static Timer _watchdog;
+        private static readonly TimeSpan WatchdogInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan WatchdogThreshold = TimeSpan.FromSeconds(20);
+
         private sealed class PendingCommand
         {
             public PendingCommand(
@@ -81,6 +95,54 @@ namespace MCPForUnity.Editor.Services.Transport
             {
                 updateHooked = true;
                 EditorApplication.update += ProcessQueue;
+            }
+
+            // Background watchdog: detects a main-thread handler that has overrun (the freeze signature)
+            // and names it in the log. Disposed before each domain reload so it doesn't outlive the
+            // AppDomain (the static ctor re-creates it on the next load).
+            _watchdog = new Timer(_ => WatchdogTick(), null, WatchdogInterval, WatchdogInterval);
+            AssemblyReloadEvents.beforeAssemblyReload += DisposeWatchdog;
+        }
+
+        private static void DisposeWatchdog()
+        {
+            try { _watchdog?.Dispose(); } catch { }
+            _watchdog = null;
+        }
+
+        // Marks the start of a synchronous main-thread handler so the watchdog can time it.
+        private static void BeginExecuting(string commandType)
+        {
+            _executingCommandType = commandType;
+            _watchdogWarned = false;
+            Interlocked.Exchange(ref _executingStartedAtTicks, DateTime.UtcNow.Ticks);
+        }
+
+        private static void EndExecuting()
+        {
+            Interlocked.Exchange(ref _executingStartedAtTicks, 0);
+            _executingCommandType = null;
+        }
+
+        // Runs on a background timer thread (so it still fires while the main thread is frozen).
+        private static void WatchdogTick()
+        {
+            long started = Interlocked.Read(ref _executingStartedAtTicks);
+            if (started == 0 || _watchdogWarned)
+            {
+                return;
+            }
+
+            var elapsed = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - started);
+            if (elapsed >= WatchdogThreshold)
+            {
+                _watchdogWarned = true;
+                // Debug.LogWarning (via McpLog) writes to Editor.log from this background thread even
+                // when the main thread is wedged, so this line survives a force-quit as the culprit.
+                McpLog.Warn(
+                    $"Command '{_executingCommandType}' has been executing on the Unity main thread for " +
+                    $"{elapsed.TotalSeconds:F0}s — the editor is likely frozen on this handler. " +
+                    "If you force-quit, this is the operation to fix.");
             }
         }
 
@@ -228,6 +290,14 @@ namespace MCPForUnity.Editor.Services.Transport
 
             try
             {
+            // Don't run handlers while the editor is compiling or mid asset-DB/domain-reload: executing
+            // a tool against types/assemblies that are being swapped is a freeze risk. Commands stay
+            // queued and run on a later update tick once the editor is idle.
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                return;
+            }
+
             List<(string id, PendingCommand pending)> ready;
 
             lock (PendingLock)
@@ -363,7 +433,19 @@ namespace MCPForUnity.Editor.Services.Transport
 
                 var logType = resourceMeta != null ? "resource" : toolMeta != null ? "tool" : "unknown";
                 var sw = McpLogRecord.IsEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
-                var result = CommandRegistry.ExecuteCommand(command.type, parameters, pending.CompletionSource);
+                // Time the synchronous handler so the background watchdog can name it if it freezes the
+                // main thread. Async commands (result == null) hand off to a TCS and don't block past
+                // this call, so timing only the inline execution is correct.
+                object result;
+                BeginExecuting(command.type);
+                try
+                {
+                    result = CommandRegistry.ExecuteCommand(command.type, parameters, pending.CompletionSource);
+                }
+                finally
+                {
+                    EndExecuting();
+                }
 
                 if (result == null)
                 {
